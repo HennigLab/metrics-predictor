@@ -1,8 +1,12 @@
+from json import load
+
+from networkx import radius
 import spikeinterface as si
 import spikeinterface.comparison as sc
 import spikeinterface.extractors as se
 import spikeinterface.postprocessing as sp
 import spikeinterface.qualitymetrics as sqm
+from spikeinterface.postprocessing import compute_principal_components
 
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
@@ -61,20 +65,28 @@ sorter_shorthand = {
     }
 
 METRIC_LIST = [
-    'num_spikes', 
-    'firing_rate', 
-    'presence_ratio', 
-    'snr', 
-    'isi_violations_ratio', 
-    'isi_violations_count', 
-    'rp_contamination', 
-    'rp_violations', 
-    'sliding_rp_violation', 
-    'amplitude_cutoff', 
-    'amplitude_median', 
+    'num_spikes',
+    'firing_rate',
+    'presence_ratio',
+    'snr',
+    'isi_violation',
+    'rp_violation',
+    'sliding_rp_violation',
+    'amplitude_cutoff',
+    'amplitude_median',
+    'amplitude_cv',
+    'sync_spike_2', 'sync_spike_4', 'sync_spike_8',
+    'firing_range',
     'drift_ptp', 
     'drift_std', 
-    'drift_mad'
+    'drift_mad',
+    'isolation_distance',
+    'l_ratio',
+    'd_prime',
+    'nearest_neighbor',
+    'nn_isolation',
+    'nn_noise_overlap',
+    'silhouette'
     ]
 
 skew_to_log = [
@@ -83,7 +95,8 @@ skew_to_log = [
     'isi_violations_ratio',
     'isi_violations_count',
     'rp_violations',
-    'amplitude_cutoff'
+    'amplitude_cutoff',
+    # 'snr'
     ]
 
 UNIT_INFO = ['sorter', 'sorter_unit_id', 'recording']
@@ -203,7 +216,18 @@ class MetricsPredictor():
         else:
             return [s['sorting_name'] for s in self.sortings if s['recording_name']==recording_name]
 
-    def compute_metrics(self, n_jobs=-1, recompute=False, overwrite_waveforms=False, max_spikes_per_unit=200, metric_list=None) -> None:
+    def compute_metrics(
+            self, 
+            n_jobs=-1, 
+            recompute=False, 
+            overwrite_waveforms=False, 
+            overwrite_pca=False, 
+            overwrite_locations=False, 
+            max_spikes_per_unit=200,
+            n_pca_components=3, 
+            metric_list=None, 
+            verbose=False
+            ) -> None:
         """
         Compute quality metrics for all sortings in study, or load cached metrics
         """
@@ -212,32 +236,40 @@ class MetricsPredictor():
         if metric_list is None:
             metric_list = sqm.get_quality_metric_list()
         metrics = []
-        for i,sorting in enumerate(self.sortings):
+
+        for sorting in self.sortings:
             recording_name = sorting["recording_name"]
             sorting_name = sorting["sorting_name"]
             metrics_file = self.study_folder/f'metrics_{recording_name}_{sorting_name}.csv'
             if os.path.exists(metrics_file) and not recompute:
-                print(f'loading cached metrics for {sorting["recording_name"]}/{sorting["sorting_name"]} from {metrics_file}')
+                if verbose:
+                    print(f'loading cached metrics for {sorting["recording_name"]}/{sorting["sorting_name"]} from {metrics_file}')
                 metrics.append(pd.read_csv(metrics_file))
-                # metrics_df = pd.concat(metrics)
             else:
-                print(f'computing metrics for {sorting["recording_name"]}/{sorting["sorting_name"]}')
-                self.waveform_extractors = self._create_waveform_extractors(
+                if verbose:
+                    print(f'computing metrics for {sorting["recording_name"]}/{sorting["sorting_name"]}')
+                waveform_extractor = self._create_waveform_extractor(
+                    sorting,
                     max_spikes_per_unit=max_spikes_per_unit,
                     n_jobs=1,
                     overwrite=overwrite_waveforms,
-                    cache_folder=self.study_folder
+                    cache_folder=self.study_folder,
+                    n_pca_components=n_pca_components,
+                    overwrite_pca=overwrite_pca,
+                    overwrite_locations=overwrite_locations,
+                    verbose=verbose
                     )
                 m = sqm.compute_quality_metrics(
-                    self.waveform_extractors[i], metric_names=metric_list, n_jobs=n_jobs, load_if_exists=False
+                    waveform_extractor, metric_names=metric_list, n_jobs=n_jobs, load_if_exists=False, verbose=verbose
                 )
                 m["sorter"] = sorting['sorting_name']
                 m["recording"] = sorting['recording_name']
                 m["sorter_unit_id"] = sorting['sorting'].get_unit_ids()
                 metrics.append(m)
-                print(f'saving to {metrics_file}')
+                if verbose:
+                    print(f'saving to {metrics_file}')
                 pd.DataFrame(m).to_csv(metrics_file, index=False)
-        metrics_df = pd.concat(metrics)
+        metrics_df = pd.concat(metrics, ignore_index=True)
         self.metrics_df = metrics_df
         na_dict = print_missing_values(self.metrics_df, print_result=False)
         self.metrics_df = drop_cols_with_all_nans(self.metrics_df, na_dict)
@@ -342,11 +374,14 @@ class MetricsPredictor():
         f1 = f1_score(y_test[mask], y_preds[mask])
         recall = recall_score(y_test[mask], y_preds[mask])
         precision = precision_score(y_test[mask], y_preds[mask])
+        true_positives = np.sum(y_test[mask] * y_preds[mask])
+        false_positives = np.sum((1-y_test[mask]) * y_preds[mask])
+        false_negatives = np.sum(y_test[mask] * (1-y_preds[mask]))
         if print_stats:
             print("f1 score:", f1)
             print("recall:   ", recall)
             print("precision:", precision)
-        return f1, recall, precision
+        return f1, recall, precision, true_positives, false_positives, false_negatives, np.sum(y_test[mask]), len(y_test[mask])
 
     def _log_transform_train_test_metrics(self):
         pd.options.mode.chained_assignment = None 
@@ -377,23 +412,57 @@ class MetricsPredictor():
                 mask = self.test_df[col].isnull()
                 self.test_df.loc[mask, col] = val
 
-        self._clear_train_test(verbose=verbose)
+        from sklearn.impute import SimpleImputer, KNNImputer
+        # imp = SimpleImputer(missing_values=np.nan, strategy='mean')
+        imp = KNNImputer(n_neighbors=5, weights="distance")
+        
         metrics, _, _, _ = self._separate_cols_to_categories(self.metrics_df, False)
-        badmetrics = (pd.isnull(self.train_df[metrics]).any()) | (pd.isnull(self.test_df[metrics]).any())
-        for col in badmetrics[badmetrics == True].keys():
-            if (pd.isnull(self.train_df[col]).all()) or (pd.isnull(self.test_df[col]).all()):
-                self.train_df = self.train_df.drop(col, axis=1)
-                self.test_df = self.test_df.drop(col, axis=1)
+        metrics_array = self.train_df[metrics].values
+        metrics_array = imp.fit_transform(metrics_array)
+        self.train_df[metrics] = metrics_array
+        metrics_array = self.test_df[metrics].values
+        metrics_array = imp.fit_transform(metrics_array)
+        self.test_df[metrics] = metrics_array
+        
+        # self._clear_train_test(verbose=verbose)
+        # metrics, _, _, _ = self._separate_cols_to_categories(self.metrics_df, False)
+        # self.test_df = self.test_df.replace([np.inf, -np.inf], np.nan)
+        # self.train_df = self.train_df.replace([np.inf, -np.inf], np.nan)
+        # badmetrics = (pd.isnull(self.train_df[metrics]).any()) | (pd.isnull(self.test_df[metrics]).any()) 
+        # if verbose:
+        #     print('bad metrics:')
+        #     print(badmetrics[badmetrics == True].keys())
+        # for col in badmetrics[badmetrics == True].keys():
+        #     if (pd.isnull(self.train_df[col]).all()) or (pd.isnull(self.test_df[col]).all()):
+        #         self.train_df = self.train_df.drop(col, axis=1)
+        #         self.test_df = self.test_df.drop(col, axis=1)
                 
-        if 'amplitude_cutoff' in self.train_df.columns:
-            max_amplitude_cutoff = self.train_df.amplitude_cutoff.max()
-            fix_simple(badmetrics, 'amplitude_cutoff', max_amplitude_cutoff, verbose=verbose)
-        fix_simple(badmetrics, 'sliding_rp_violation', 1, verbose=verbose)
-        fix_simple(badmetrics, 'drift_ptp', 0, verbose=verbose)
-        fix_simple(badmetrics, 'drift_std', 0, verbose=verbose)
-        fix_simple(badmetrics, 'drift_mad', 0, verbose=verbose)
-        fix_simple(badmetrics, 'rp_violations', 0, verbose=verbose)
-
+        # if 'amplitude_cutoff' in self.train_df.columns:
+        #     max_amplitude_cutoff = self.train_df.amplitude_cutoff.max()
+        #     fix_simple(badmetrics, 'amplitude_cutoff', max_amplitude_cutoff, verbose=verbose)
+        # fix_simple(badmetrics, 'sliding_rp_violation', 0, verbose=verbose)
+        # # fix_simple(badmetrics, 'drift_ptp', 0, verbose=verbose)
+        # fix_simple(badmetrics, 'drift_std', 0, verbose=verbose)
+        # fix_simple(badmetrics, 'drift_mad', 0, verbose=verbose)
+        # fix_simple(badmetrics, 'snr', 0, verbose=verbose)
+        # # set rp_violations to max if bad
+        # if 'rp_violations' in self.train_df.columns:
+        #     max_rp_violations = self.train_df.rp_violations.max()
+        #     fix_simple(badmetrics, 'rp_violations', max_rp_violations, verbose=verbose)
+        # # fix_simple(badmetrics, 'rp_violations', 0, verbose=verbose)
+        # fix_simple(badmetrics, 'isolation_distance', 0, verbose=verbose)
+        # # set l_ratio to max if bad
+        # if 'l_ratio' in self.train_df.columns:
+        #     max_l_ratio = self.train_df.l_ratio.max()
+        #     fix_simple(badmetrics, 'l_ratio', max_l_ratio, verbose=verbose)
+        # # fix_simple(badmetrics, 'l_ratio', 0, verbose=verbose)
+        # fix_simple(badmetrics, 'd_prime', 0, verbose=verbose)
+        # fix_simple(badmetrics, 'silhouette', 0, verbose=verbose)
+        # # compute abs of d_prime if in dataframe
+        # # if 'd_prime' in self.train_df.columns:
+        # #     self.train_df['d_prime'] = np.abs(self.train_df['d_prime'])
+        # #     self.test_df['d_prime'] = np.abs(self.test_df['d_prime'])
+       
     def _standard_scale_train_test_metrics(self):
         # standard-scale metrics
         # metrics, _, _, _ = self._separate_cols_to_categories(self.metrics_df, False)
@@ -510,48 +579,61 @@ class MetricsPredictor():
             # X_trn_resampled, y_trn_resampled = SMOTEENN().fit_resample(X_trn, y_trn)
             # X_trn_resampled, y_trn_resampled = SMOTETomek().fit_resample(X_trn, y_trn)
             self.model = LogisticRegression(solver=solver, random_state=random_state, penalty=penalty,C=C).fit(X_trn_resampled, y_trn_resampled)
+            # self.model = RandomForestClassifier().fit(X_trn_resampled, y_trn_resampled)
         else:
             self.model = LogisticRegression(solver=solver, random_state=random_state, penalty=penalty,C=C).fit(X_trn, y_trn)
-        # self.model = RandomForestClassifier().fit(X_trn, y_trn)
+            # self.model = RandomForestClassifier().fit(X_trn, y_trn)
         if predict:
             return self.model.predict(X_trn)
 
-    def _create_waveform_extractors(
+    def _create_waveform_extractor(
               self,
+              sorting,
               overwrite=False,
               n_jobs=1,
               chunk_duration="0.1s",
               ms_before=0.5,
               ms_after=3,
               max_spikes_per_unit=200,
-              cache_folder='.'
-              ) -> list:
-        waveform_extractors = []
-        for i, sorter in enumerate(self.get_sorting_names()):
-            folder = str(cache_folder)+"/waveforms_"+self.sortings[i]['recording_name']+"_"+sorter
-            if os.path.exists(folder) and not overwrite:
+              cache_folder='.',
+              n_pca_components = 3,
+              overwrite_pca=False,
+              overwrite_locations=False,
+              verbose=False
+              ):
+        recording_name = sorting["recording_name"]
+        sorting_name = sorting["sorting_name"]
+        folder = str(cache_folder)+"/waveforms_"+recording_name+"_"+sorting_name
+        if os.path.exists(folder) and not overwrite:
+            if verbose:
                 print('loading cached waveforms from '+folder)
-                we_disk = si.core.load_waveforms(folder=folder, sorting=self.sortings[i]['sorting'])
-            else:
+            we_disk = si.core.load_waveforms(folder=folder, sorting=sorting['sorting'])
+        else:
+            if verbose:
                 print('caching waveforms to '+folder)
-                job_kwargs = dict(n_jobs=n_jobs, chunk_duration=chunk_duration)
-                we_disk = si.core.extract_waveforms(
-                    self.sortings[i]['recording'],
-                    self.sortings[i]['sorting'],
-                    mode="folder",
-                    max_spikes_per_unit=max_spikes_per_unit,
-                    folder=folder,
-                    overwrite=True,
-                    allow_unfiltered=False,
-                    ms_before=ms_before,
-                    ms_after=ms_after,
-                    **job_kwargs
-                )
-            if "spike_locations" not in we_disk.get_available_extension_names():
+            job_kwargs = dict(n_jobs=n_jobs, chunk_duration=chunk_duration)
+            we_disk = si.core.extract_waveforms(
+                sorting['recording'],
+                sorting['sorting'],
+                mode="folder",
+                max_spikes_per_unit=max_spikes_per_unit,
+                folder=folder,
+                overwrite=True,
+                allow_unfiltered=False,
+                ms_before=ms_before,
+                ms_after=ms_after,
+                sparse=True,
+                method="radius",
+                num_spikes_for_sparsity=100,
+                radius_um=60,
+                **job_kwargs
+            )
+        if "spike_locations" not in we_disk.get_available_extension_names() or overwrite_locations:
+            if verbose:
                 print('computing spike locations')
-                sp.compute_spike_locations(we_disk)
-            waveform_extractors.append(we_disk)
-        return waveform_extractors
+            sp.compute_spike_locations(we_disk, load_if_exists=not(overwrite_locations))
+        compute_principal_components(we_disk, load_if_exists=not(overwrite_pca), n_components=n_pca_components, mode='by_channel_local')
+        return we_disk
 
     def _get_ground_truth_comparison(self, SX_gt, recording_name, well_detected_score = 0.8, overwrite_comparison = False):
         # compare sortings to ground truth
