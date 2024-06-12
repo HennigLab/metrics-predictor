@@ -65,30 +65,32 @@ def get_recording(recording_dir, cached_recording_folder, short_test=False):
 if __name__ == "__main__":
     # use small data segment for testing if True
     testing = True
+    
     # identifier of recording
-    recording_name = "PV2555_20221020_g0_imec0_short"
-    # recording_name = "PV2555_20221020_g0_imec0"
+    recording_name = "PV2555_20221020_g0_imec0_short" # "PV2555_20221020_g0_imec0"
     # recording location
     recording_folder_name = "/disk/data/musall_lab/Neuropixels/PV2555_20221020/PV2555_20221020_g0/PV2555_20221020_g0_imec0/"
     # root folder to store all outputs
     study_folder_name = "studies"
+
     # sorters to run
     run_sorters = [
         "herdingspikes",
         "ironclust",
         "kilosort",
         "kilosort2",
-        "kilosort2_5",
+        # "kilosort2_5",
         "kilosort3",
-        # "kilosort4",
+        "kilosort4", # previously commented
         # "pykilosort",
         "tridesclous",
         # "tridesclous2",
-        ##"spykingcircus",
+        # "spykingcircus",
         # "spykingcircus2",
         "mountainsort5",
     ]
 
+    # setup paths
     study_folder = Path(study_folder_name)
     if not study_folder.is_dir():
         study_folder.mkdir()
@@ -99,12 +101,13 @@ if __name__ == "__main__":
     if not output_folder.is_dir():
         output_folder.mkdir()
 
+    # load recording
     RX = get_recording(recording_folder, cached_recording_folder, testing)
 
+    # identify local installs of sorters
     run_sorters = list(set(run_sorters) & set(ss.available_sorters()))
     run_sorters_installed = list(set(run_sorters) & set(ss.installed_sorters()))
     run_sorters_not_installed = list(set(run_sorters) - set(run_sorters_installed))
-
     print(f"sorters to run in a container:\n{run_sorters_not_installed}")
     print(f"sorters to run from local install: \n{run_sorters_installed}")
 
