@@ -175,7 +175,7 @@ class MetricsPredictor:
                     .to_string()
                 )
 
-    def get_study_info(self) -> tuple[list, list, dict, list]:
+    def get_study_info(self):
         """
         Get information about the study
 
