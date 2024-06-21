@@ -21,7 +21,8 @@ import os, sys
 # import spikeinterface as si
 import spikeinterface.sorters as ss
 import spikeinterface.extractors as se
-from spikeinterface.preprocessing import bandpass_filter
+from spikeinterface.preprocessing import bandpass_filter, highpass_filter
+from spikeinterface.preprocessing import common_reference, phase_shift
 from spikeinterface.sorters import run_sorter
 import numpy as np
 from pathlib import Path
@@ -47,11 +48,11 @@ def get_recording(recording_dir, cached_recording_folder, short_test=False):
             t2 = 10  # 10 seconds of data only
             RX = RX.frame_slice(0, t2 * RX.get_sampling_frequency())
         # skip these for now as this is already dfone on Musall data:
-        # RX = phase_shift(RX)
-        # RX = common_reference(RX, operator="median", reference="global")
-        # RX = highpass_filter(RX, freq_min=400.0)
+        RX = phase_shift(RX)
+        RX = common_reference(RX, operator="median", reference="global")
+        RX = highpass_filter(RX, freq_min=400.0)
         # most sorters require/benefit from bandpass filtered data:
-        RX = bandpass_filter(RX, freq_min=300.0, freq_max=6000.0)
+        # RX = bandpass_filter(RX, freq_min=300.0, freq_max=6000.0)
         print(f"saving preprocessed recording: {cached_recording_folder}")
         job_kwargs = dict(n_jobs=4, chunk_duration="1s", progress_bar=True)
         RX = RX.save(folder=cached_recording_folder, format="binary", **job_kwargs)

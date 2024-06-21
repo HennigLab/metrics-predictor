@@ -179,8 +179,6 @@ if __name__ == "__main__":
     
     study_folder_name = "./studies" # root folder to store all outputs
 
-
-
     # set up paths
     study_folder = Path(study_folder_name)
     recording_folder = Path(recording_folder_name)
@@ -197,8 +195,6 @@ if __name__ == "__main__":
 
     # create a metrics predictor
     MP = MetricsPredictor(recording_name, study_folder=study_folder)
-
-    #
 
     # read thr original KS2_5 sorting
     # SX = se.KiloSortSortingExtractor(
@@ -223,7 +219,7 @@ if __name__ == "__main__":
     # folder = MP.cache_folder + "/waveforms_" + recording_name + "_" + sorting_name # this is where compute metrics will put waveforms
     MP.compute_metrics(
         recompute=False,
-        max_spikes_per_unit=100,
+        max_spikes_per_unit=500, #100,
         overwrite_waveforms=False,
         metric_list=METRIC_LIST,
         n_jobs=-1,
