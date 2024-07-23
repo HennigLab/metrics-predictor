@@ -21,7 +21,8 @@ import os, sys
 # import spikeinterface as si
 import spikeinterface.sorters as ss
 import spikeinterface.extractors as se
-from spikeinterface.preprocessing import bandpass_filter
+from spikeinterface.preprocessing import bandpass_filter, highpass_filter
+from spikeinterface.preprocessing import common_reference, phase_shift
 from spikeinterface.sorters import run_sorter
 import numpy as np
 from pathlib import Path
@@ -47,11 +48,11 @@ def get_recording(recording_dir, cached_recording_folder, short_test=False):
             t2 = 10  # 10 seconds of data only
             RX = RX.frame_slice(0, t2 * RX.get_sampling_frequency())
         # skip these for now as this is already dfone on Musall data:
-        # RX = phase_shift(RX)
-        # RX = common_reference(RX, operator="median", reference="global")
-        # RX = highpass_filter(RX, freq_min=400.0)
+        RX = phase_shift(RX)
+        RX = common_reference(RX, operator="median", reference="global")
+        RX = highpass_filter(RX, freq_min=400.0)
         # most sorters require/benefit from bandpass filtered data:
-        RX = bandpass_filter(RX, freq_min=300.0, freq_max=6000.0)
+        # RX = bandpass_filter(RX, freq_min=300.0, freq_max=6000.0)
         print(f"saving preprocessed recording: {cached_recording_folder}")
         job_kwargs = dict(n_jobs=4, chunk_duration="1s", progress_bar=True)
         RX = RX.save(folder=cached_recording_folder, format="binary", **job_kwargs)
@@ -65,30 +66,32 @@ def get_recording(recording_dir, cached_recording_folder, short_test=False):
 if __name__ == "__main__":
     # use small data segment for testing if True
     testing = True
+    
     # identifier of recording
-    recording_name = "PV2555_20221020_g0_imec0_short"
-    # recording_name = "PV2555_20221020_g0_imec0"
+    recording_name = "PV2555_20221020_g0_imec0_short" # "PV2555_20221020_g0_imec0"
     # recording location
     recording_folder_name = "/disk/data/musall_lab/Neuropixels/PV2555_20221020/PV2555_20221020_g0/PV2555_20221020_g0_imec0/"
     # root folder to store all outputs
     study_folder_name = "studies"
+
     # sorters to run
     run_sorters = [
         "herdingspikes",
         "ironclust",
         "kilosort",
         "kilosort2",
-        "kilosort2_5",
+        # "kilosort2_5",
         "kilosort3",
-        # "kilosort4",
+        "kilosort4", # previously commented
         # "pykilosort",
         "tridesclous",
         # "tridesclous2",
-        ##"spykingcircus",
+        # "spykingcircus",
         # "spykingcircus2",
         "mountainsort5",
     ]
 
+    # setup paths
     study_folder = Path(study_folder_name)
     if not study_folder.is_dir():
         study_folder.mkdir()
@@ -99,12 +102,13 @@ if __name__ == "__main__":
     if not output_folder.is_dir():
         output_folder.mkdir()
 
+    # load recording
     RX = get_recording(recording_folder, cached_recording_folder, testing)
 
+    # identify local installs of sorters
     run_sorters = list(set(run_sorters) & set(ss.available_sorters()))
     run_sorters_installed = list(set(run_sorters) & set(ss.installed_sorters()))
     run_sorters_not_installed = list(set(run_sorters) - set(run_sorters_installed))
-
     print(f"sorters to run in a container:\n{run_sorters_not_installed}")
     print(f"sorters to run from local install: \n{run_sorters_installed}")
 

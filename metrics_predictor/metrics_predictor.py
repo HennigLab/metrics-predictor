@@ -182,7 +182,7 @@ class MetricsPredictor:
                     .to_string()
                 )
 
-    def get_study_info(self) -> tuple[list, list, dict, list]:
+    def get_study_info(self):
         """
         Get information about the study
 
@@ -730,8 +730,8 @@ class MetricsPredictor:
         overwrite=False,
         n_jobs=1,
         chunk_duration="0.1s",
-        ms_before=0.5,
-        ms_after=3,
+        ms_before=1, #0.5,
+        ms_after=2, #3,
         max_spikes_per_unit=200,
         cache_folder=".",
         n_pca_components=3,
