@@ -63,8 +63,10 @@ METRIC_LIST = [
     "firing_rate",
     "presence_ratio",
     "snr",
-    "isi_violation",
-    "rp_violation",
+    "isi_violations_ratio",
+    "isi_violations_count",
+    "rp_contamination",
+    "rp_violations",
     "sliding_rp_violation",
     "amplitude_cutoff",
     "amplitude_median",
@@ -83,16 +85,21 @@ METRIC_LIST = [
     "nn_isolation",
     "nn_noise_overlap",
     "silhouette",
+    'nn_hit_rate', 
+    'nn_miss_rate', 
+    'nn_unit_id'
 ]
 
 skew_to_log = [
     "num_spikes",
     "firing_rate",
-    "isi_violations_ratio",
-    "isi_violations_count",
-    "rp_violations",
-    "amplitude_cutoff",
-    # 'snr'
+    # "isolation_distance",
+    # 'snr',
+    # "isi_violations_ratio",
+    # "isi_violations_count",
+    # "amplitude_median",
+    # "rp_violations",
+    # "amplitude_cutoff",
 ]
 
 UNIT_INFO = ["sorter", "sorter_unit_id", "recording"]
@@ -407,9 +414,9 @@ class MetricsPredictor:
         overwrite_comparison: bool
             if True, force recompute ground truth comparison when cached comparison exists
         """
-        assert (
-            self.metrics_df is not None
-        ), "compute metrics before adding ground truth information"
+        # assert (
+        #     self.metrics_df is not None
+        # ), "compute metrics before adding ground truth information"
         self.SX_gt = SX_gt
         self.sorter_good_ids = self._get_ground_truth_comparison(
             SX_gt, recording_name, well_detected_score, overwrite_comparison
@@ -418,6 +425,12 @@ class MetricsPredictor:
         if gt_label not in self.metrics_df.keys():
             self.metrics_df[gt_label] = 0
         for sorter, good_unit_list in self.sorter_good_ids.items():
+            self.metrics_df[gt_label].mask(
+                (self.metrics_df["sorter"] == sorter)
+                & (self.metrics_df["recording"] == recording_name),
+                0,
+                inplace=True,
+            )
             self.metrics_df[gt_label].mask(
                 (self.metrics_df["sorter"] == sorter)
                 & (self.metrics_df["sorter_unit_id"].isin(good_unit_list))
@@ -480,12 +493,9 @@ class MetricsPredictor:
         ordered_unique_train = self.train_df[metrics].apply(
             lambda x: np.max((x.sort_values().unique()[0], 1e-5)), axis=0
         )
-        # ordered_unique_train = train_df_trans[metrics].apply(lambda x: x.sort_values().unique()[1], axis=0)
         for met in list(set(skew_to_log) & set(metrics)):
             second_smallest = ordered_unique_train[met]
             half_second_smallest = second_smallest / 2
-            # half_second_smallest = 1e-5
-            # must apply same transforms to val an test
             mask = self.train_df[met] == 0
             self.train_df.loc[mask, met] = half_second_smallest
             mask = self.test_df[met] == 0
@@ -702,13 +712,14 @@ class MetricsPredictor:
         X_trn = self.train_df[metrics]
         y_trn = self.train_df[target_feature]
         if oversample:
-            X_trn_resampled, y_trn_resampled = SMOTE().fit_resample(X_trn, y_trn)  # type: ignore
+            # print(y_trn.isna().sum())
+            X_trn_resampled, y_trn_resampled = SMOTE().fit_resample(X_trn, y_trn)
             self.model = LogisticRegression(
-                solver=solver, random_state=random_state, penalty=penalty, C=C  # type: ignore
+                solver=solver, random_state=random_state, penalty=penalty, C=C
             ).fit(X_trn_resampled, y_trn_resampled)
         else:
             self.model = LogisticRegression(
-                solver=solver, random_state=random_state, penalty=penalty, C=C  # type: ignore
+                solver=solver, random_state=random_state, penalty=penalty, C=C
             ).fit(X_trn, y_trn)
         if predict:
             return self.model.predict(X_trn)
