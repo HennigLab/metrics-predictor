@@ -85,9 +85,9 @@ METRIC_LIST = [
     "nn_isolation",
     "nn_noise_overlap",
     "silhouette",
-    'nn_hit_rate', 
-    'nn_miss_rate', 
-    'nn_unit_id'
+    "nn_hit_rate",
+    "nn_miss_rate",
+    "nn_unit_id",
 ]
 
 skew_to_log = [
@@ -252,7 +252,7 @@ class MetricsPredictor:
         self,
         n_jobs=1,
         recompute=False,
-        overwrite_waveforms=False,
+        overwrite=False,
         overwrite_pca=False,
         overwrite_locations=False,
         max_spikes_per_unit=50,
@@ -292,31 +292,38 @@ class MetricsPredictor:
                     print(
                         f'computing metrics for {sorting["recording_name"]}/{sorting["sorting_name"]}'
                     )
-                waveform_extractor = self._create_waveform_extractor(
+                sorting_analyzer = self._create_sorting_analyzer(
                     sorting,
                     max_spikes_per_unit=max_spikes_per_unit,
                     n_jobs=1,
-                    overwrite=overwrite_waveforms,
+                    overwrite=overwrite,
                     cache_folder=self.cache_folder,  # type: ignore
                     n_pca_components=n_pca_components,
-                    overwrite_pca=overwrite_pca,
-                    overwrite_locations=overwrite_locations,
+                    # overwrite_pca=overwrite_pca,
+                    # overwrite_locations=overwrite_locations,
                     verbose=verbose,
                 )
-                m = sqm.compute_quality_metrics(
-                    waveform_extractor,
+                m = sorting_analyzer.compute(
+                    "quality_metrics",
                     metric_names=metric_list,
                     n_jobs=n_jobs,
-                    load_if_exists=False,
+                    # load_if_exists=False,
                     verbose=verbose,
-                )
+                ).get_data()
+                # m = sqm.compute_quality_metrics(
+                #     sorting_analyser,
+                #     metric_names=metric_list,
+                #     n_jobs=n_jobs,
+                #     load_if_exists=False,
+                #     verbose=verbose,
+                # )
                 mask = (self.metrics_df["recording"] == sorting["recording_name"]) & (
                     self.metrics_df["sorter"] == sorting["sorting_name"]
                 )
                 for k in m.keys():
                     if k not in self.metrics_df.keys():
-                        self.metrics_df[k] = 0
-                    self.metrics_df.loc[mask, k] = m[k]
+                        self.metrics_df[k] = 0.0
+                    self.metrics_df.loc[mask, k] = m[k].values
                 if verbose:
                     print(f"saving to {metrics_file}")
                 pd.DataFrame(m).to_csv(metrics_file, index=False)
@@ -425,19 +432,30 @@ class MetricsPredictor:
         if gt_label not in self.metrics_df.keys():
             self.metrics_df[gt_label] = 0
         for sorter, good_unit_list in self.sorter_good_ids.items():
-            self.metrics_df[gt_label].mask(
+            self.metrics_df.loc[
                 (self.metrics_df["sorter"] == sorter)
                 & (self.metrics_df["recording"] == recording_name),
-                0,
-                inplace=True,
-            )
-            self.metrics_df[gt_label].mask(
+                gt_label,
+            ] = 0
+            # self.metrics_df[gt_label].mask(
+            #     (self.metrics_df["sorter"] == sorter)
+            #     & (self.metrics_df["recording"] == recording_name),
+            #     0,
+            #     inplace=True,
+            # )
+            self.metrics_df.loc[
                 (self.metrics_df["sorter"] == sorter)
                 & (self.metrics_df["sorter_unit_id"].isin(good_unit_list))
                 & (self.metrics_df["recording"] == recording_name),
-                1,
-                inplace=True,
-            )
+                gt_label,
+            ] = 1
+            # self.metrics_df[gt_label].mask(
+            #     (self.metrics_df["sorter"] == sorter)
+            #     & (self.metrics_df["sorter_unit_id"].isin(good_unit_list))
+            #     & (self.metrics_df["recording"] == recording_name),
+            #     1,
+            #     inplace=True,
+            # )
 
     def get_model_metrics(
         self,
@@ -532,10 +550,10 @@ class MetricsPredictor:
         scaler = StandardScaler().set_output(transform="pandas")
         features_to_scale = metrics
         scaler.fit(self.train_df.loc[:, features_to_scale])
-        self.train_df[:][features_to_scale] = scaler.transform(  # type: ignore
+        self.train_df.loc[:, features_to_scale] = scaler.transform(  # type: ignore
             self.train_df[features_to_scale]
         )
-        self.test_df[:][features_to_scale] = scaler.transform(  # type: ignore
+        self.test_df.loc[:, features_to_scale] = scaler.transform(  # type: ignore
             self.test_df[features_to_scale]
         )
 
@@ -724,19 +742,19 @@ class MetricsPredictor:
         if predict:
             return self.model.predict(X_trn)
 
-    def _create_waveform_extractor(
+    def _create_sorting_analyzer(
         self,
         sorting,
         overwrite=False,
         n_jobs=1,
         chunk_duration="0.1s",
-        ms_before=1, #0.5,
-        ms_after=2, #3,
+        ms_before=1,  # 0.5,
+        ms_after=2,  # 3,
         max_spikes_per_unit=200,
         cache_folder=".",
         n_pca_components=3,
-        overwrite_pca=False,
-        overwrite_locations=False,
+        # overwrite_pca=False,
+        # overwrite_locations=False,
         verbose=False,
     ):
         recording_name = sorting["recording_name"]
@@ -745,19 +763,20 @@ class MetricsPredictor:
         if os.path.exists(folder) and not overwrite:
             if verbose:
                 print("loading cached waveforms from " + folder)
-            we_disk = si.core.load_waveforms(folder=folder, sorting=sorting["sorting"])
+            sa_disk = si.core.load_sorting_analyzer(folder=folder)
         else:
             if verbose:
                 print("caching waveforms to " + folder)
             job_kwargs = dict(n_jobs=n_jobs, chunk_duration=chunk_duration)
-            we_disk = si.core.extract_waveforms(
-                sorting["recording"],
-                sorting["sorting"],
-                mode="folder",
-                max_spikes_per_unit=max_spikes_per_unit,
+            sa_disk = si.core.create_sorting_analyzer(
+                recording=sorting["recording"],
+                sorting=sorting["sorting"],
+                # mode="folder",
+                format="binary_folder",
+                # max_spikes_per_unit=max_spikes_per_unit,
                 folder=folder,
                 overwrite=True,
-                allow_unfiltered=False,
+                # allow_unfiltered=False,
                 ms_before=ms_before,
                 ms_after=ms_after,
                 sparse=True,
@@ -766,22 +785,32 @@ class MetricsPredictor:
                 radius_um=60,
                 **job_kwargs,
             )
-        if (
-            "spike_locations" not in we_disk.get_available_extension_names()
-            or overwrite_locations
-        ):
-            if verbose:
-                print("computing spike locations")
-            sp.compute_spike_locations(
-                we_disk, load_if_exists=not (overwrite_locations)
-            )
-        compute_principal_components(
-            we_disk,
-            load_if_exists=not (overwrite_pca),
-            n_components=n_pca_components,
-            mode="by_channel_local",
-        )
-        return we_disk
+            sa_disk.compute("noise_levels")
+            sa_disk.compute("random_spikes")
+            sa_disk.compute("waveforms")
+            sa_disk.compute("templates", operators=["average", "median"])
+            # sa_disk.compute("templates", operators="median")
+            # sa_disk.compute("unit_locations")
+            sa_disk.compute("principal_components")
+            sa_disk.compute("spike_locations")
+            sa_disk.compute("spike_amplitudes")
+
+        # if (
+        #     "spike_locations" not in we_disk.get_available_extension_names()
+        #     or overwrite_locations
+        # ):
+        #     if verbose:
+        #         print("computing spike locations")
+        #     sp.compute_spike_locations(
+        #         we_disk, load_if_exists=not (overwrite_locations)
+        #     )
+        # compute_principal_components(
+        #     we_disk,
+        #     load_if_exists=not (overwrite_pca),
+        #     n_components=n_pca_components,
+        #     mode="by_channel_local",
+        # )
+        return sa_disk
 
     def _get_ground_truth_comparison(
         self, SX_gt, recording_name, well_detected_score=0.8, overwrite_comparison=False
