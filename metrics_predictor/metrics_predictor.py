@@ -1,13 +1,9 @@
 import os
+
 from pathlib import Path
 import pickle
 
-import spikeinterface as si
-import spikeinterface.comparison as sc
-import spikeinterface.extractors as se
-import spikeinterface.postprocessing as sp
-import spikeinterface.qualitymetrics as sqm
-from spikeinterface.postprocessing import compute_principal_components
+import spikeinterface.full as si
 
 import pandas as pd
 import numpy as np
@@ -15,12 +11,14 @@ import numpy as np
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
 from imblearn.over_sampling import SMOTE
 from sklearn.metrics import (
     classification_report,
     f1_score,
     recall_score,
     precision_score,
+    balanced_accuracy_score,
 )
 
 from .utils import (
@@ -88,6 +86,17 @@ METRIC_LIST = [
     "nn_hit_rate",
     "nn_miss_rate",
     "nn_unit_id",
+    "peak_to_valley",
+    "peak_trough_ratio",
+    "half_width",
+    "repolarization_slope",
+    "recovery_slope",
+    "num_positive_peaks",
+    "num_negative_peaks",
+    "velocity_above",
+    "velocity_below",
+    "exp_decay",
+    "spread",
 ]
 
 skew_to_log = [
@@ -132,6 +141,8 @@ class MetricsPredictor:
         self.train_df = None
         self.test_df = None
         self.verbose = verbose
+        
+        self.skew_to_log = skew_to_log
 
         if study_name is None:
             # use date and time to create a study name if none is provided
@@ -250,14 +261,14 @@ class MetricsPredictor:
 
     def compute_metrics(
         self,
-        n_jobs=1,
+        n_jobs=-1,
         recompute=False,
-        overwrite=False,
-        overwrite_pca=False,
-        overwrite_locations=False,
-        max_spikes_per_unit=50,
-        n_pca_components=3,
+        overwrite_sorting_analyzer=False,
+        max_spikes_per_unit=100,
+        n_pca_components=2,
         metric_list=None,
+        # template_metric_list=None,
+        remove_outliers=True,
         verbose=False,
     ) -> None:
         """
@@ -266,7 +277,9 @@ class MetricsPredictor:
         assert self.sortings is not None, "no sortings added to study"
 
         if metric_list is None:
-            metric_list = sqm.get_quality_metric_list()
+            metric_list = (
+                si.get_quality_metric_list() + si.get_quality_pca_metric_list()
+            )
 
         for sorting in self.sortings:
             recording_name = sorting["recording_name"]
@@ -285,52 +298,68 @@ class MetricsPredictor:
                 )
                 for k in m.keys():
                     if k not in self.metrics_df.keys():
-                        self.metrics_df[k] = 0
+                        self.metrics_df[k] = None
                     self.metrics_df.loc[mask, k] = list(m[k])
             else:
                 if verbose:
                     print(
-                        f'computing metrics for {sorting["recording_name"]}/{sorting["sorting_name"]}'
+                        f'creating sorting analyzer for {sorting["recording_name"]}/{sorting["sorting_name"]}'
                     )
-                sorting_analyzer = self._create_sorting_analyzer(
+                self.sorting_analyzer = self._create_sorting_analyzer(
                     sorting,
                     max_spikes_per_unit=max_spikes_per_unit,
                     n_jobs=1,
-                    overwrite=overwrite,
+                    overwrite=overwrite_sorting_analyzer,
                     cache_folder=self.cache_folder,  # type: ignore
                     n_pca_components=n_pca_components,
-                    # overwrite_pca=overwrite_pca,
-                    # overwrite_locations=overwrite_locations,
                     verbose=verbose,
                 )
-                m = sorting_analyzer.compute(
+                if verbose:
+                    print(
+                        f'computing quality metrics for {sorting["recording_name"]}/{sorting["sorting_name"]}'
+                    )
+                m = self.sorting_analyzer.compute(
                     "quality_metrics",
                     metric_names=metric_list,
                     n_jobs=n_jobs,
-                    # load_if_exists=False,
                     verbose=verbose,
                 ).get_data()
-                # m = sqm.compute_quality_metrics(
-                #     sorting_analyser,
-                #     metric_names=metric_list,
-                #     n_jobs=n_jobs,
-                #     load_if_exists=False,
-                #     verbose=verbose,
-                # )
+                if verbose:
+                    print(
+                        f'computing template metrics for {sorting["recording_name"]}/{sorting["sorting_name"]}'
+                    )
+                mt = self.sorting_analyzer.compute(
+                    "template_metrics",
+                    n_jobs=n_jobs,
+                    verbose=verbose,
+                ).get_data()
+                m_all = m.join(mt)
                 mask = (self.metrics_df["recording"] == sorting["recording_name"]) & (
                     self.metrics_df["sorter"] == sorting["sorting_name"]
                 )
-                for k in m.keys():
+                for k in m_all.keys():
                     if k not in self.metrics_df.keys():
                         self.metrics_df[k] = 0.0
-                    self.metrics_df.loc[mask, k] = m[k].values
+                    self.metrics_df.loc[mask, k] = m_all[k].values.astype(float)
                 if verbose:
-                    print(f"saving to {metrics_file}")
-                pd.DataFrame(m).to_csv(metrics_file, index=False)
+                    print(f"saving metrics to {metrics_file}")
+                pd.DataFrame(m_all).to_csv(metrics_file, index=False)
         na_dict = print_missing_values(self.metrics_df, print_result=False)
         self.metrics_df = drop_cols_with_all_nans(
             self.metrics_df, na_dict, print_result=True
         )
+        if remove_outliers:
+            if verbose:
+                print("removing outliers")
+            metrics, _, _, _ = self.get_study_info()
+            for i, m in enumerate(metrics):
+                data = self.metrics_df[m]
+                p = np.nanpercentile(data, (0.01 * 100, 100 * (1 - 0.01)))
+                inds = (data < 2 * p[0]) | (data > p[1] * 2)
+                if verbose and np.sum(inds) > 0:
+                    n = np.sum(inds)
+                    print(f"{m} has {n} outliers")
+                self.metrics_df.loc[np.where(inds)[0], m] = np.nan
 
     def get_metrics(self) -> pd.DataFrame:
         """
@@ -339,7 +368,9 @@ class MetricsPredictor:
         assert self.metrics_df is not None, "compute metrics before getting them"
         return self.metrics_df
 
-    def compute_agreements(self, match_score=0.5, recompute=False) -> None:
+    def compute_agreements(
+        self, match_score=0.5, delta_time=0.4, chance_score=0.1, recompute=False
+    ) -> None:
         """
         Compute agreements for all sortings in study, or load cached agreements.
 
@@ -364,7 +395,7 @@ class MetricsPredictor:
                 agreement_save_folder = self.study_folder / f"{col_name}_{rec}"
                 if os.path.exists(agreement_save_folder) and not recompute:
                     print(f"loading cached agreements from {agreement_save_folder}")
-                    matching_obj = sc.MultiSortingComparison.load_from_folder(
+                    matching_obj = si.MultiSortingComparison.load_from_folder(
                         agreement_save_folder
                     )
                 else:
@@ -374,12 +405,12 @@ class MetricsPredictor:
                         for s in self.sortings
                         if s["recording_name"] == rec
                     ]
-                    matching_obj = sc.compare_multiple_sorters(
+                    matching_obj = si.compare_multiple_sorters(
                         spike_sorting_extractor_list,
                         name_list=spike_sorter_names,
-                        delta_time=0.4,
+                        delta_time=delta_time,
                         match_score=match_score,
-                        chance_score=0.1,
+                        chance_score=chance_score,
                         n_jobs=-1,
                         spiketrain_mode="union",
                         verbose=False,
@@ -476,30 +507,40 @@ class MetricsPredictor:
             y_test = comp_set[target_feature]
         mask = pd.Series([True] * len(comp_set), index=comp_set.index)
         if recording is not None:
-            mask = mask * comp_set["recording"] == recording
+            if type(recording) is list:
+                mask  = mask * comp_set["recording"].isin(recording)
+            else:
+                mask = mask * comp_set["recording"] == recording
         if sorter is not None:
-            mask = mask * comp_set["sorter"] == sorter
+            if type(sorter) is list:
+                mask  = mask * comp_set["sorter"].isin(sorter)
+            else:
+                mask = mask * comp_set["sorter"] == sorter
         f1 = f1_score(y_test[mask], y_preds[mask])
         recall = recall_score(y_test[mask], y_preds[mask])
         precision = precision_score(y_test[mask], y_preds[mask])
+        balanced_accuracy = balanced_accuracy_score(y_test[mask], y_preds[mask], adjusted=True)
         true_positives = np.sum(y_test[mask] * y_preds[mask])
         false_positives = np.sum((1 - y_test[mask]) * y_preds[mask])
         false_negatives = np.sum(y_test[mask] * (1 - y_preds[mask]))
+        true_negatives = np.sum((1 - y_test[mask]) * (1 - y_preds[mask]))
         if print_stats:
             print("f1 score:", f1)
             print("recall:   ", recall)
             print("precision:", precision)
-        return (
-            f1,
-            recall,
-            precision,
-            true_positives,
-            false_positives,
-            false_negatives,
-            np.sum(y_test[mask]),
-            len(y_test[mask]),
-        )
-
+            print("balanced_accuracy:", balanced_accuracy_score)
+        results_dict = {
+            "f1": f1,
+            "recall": recall,
+            "precision": precision,
+            "balanced_accuracy": balanced_accuracy,
+            "true_positives": true_positives,
+            "false_positives": false_positives,
+            "false_negatives": false_negatives,
+            "true_negatives": true_negatives,
+        }
+        return results_dict
+    
     def _log_transform_train_test_metrics(self) -> None:
         """
         Log transform skewed metrics
@@ -511,15 +552,19 @@ class MetricsPredictor:
         ordered_unique_train = self.train_df[metrics].apply(
             lambda x: np.max((x.sort_values().unique()[0], 1e-5)), axis=0
         )
-        for met in list(set(skew_to_log) & set(metrics)):
+        for met in list(set(self.skew_to_log) & set(metrics)):
             second_smallest = ordered_unique_train[met]
             half_second_smallest = second_smallest / 2
             mask = self.train_df[met] == 0
             self.train_df.loc[mask, met] = half_second_smallest
             mask = self.test_df[met] == 0
             self.test_df.loc[mask, met] = half_second_smallest
-            self.train_df.loc[:, met] = np.log(self.train_df.loc[:, met])
-            self.test_df.loc[:, met] = np.log(self.test_df.loc[:, met])
+            self.train_df.loc[:, met] = np.log(
+                self.train_df.loc[:, met].values.astype(float)
+            )
+            self.test_df.loc[:, met] = np.log(
+                self.test_df.loc[:, met].values.astype(float)
+            )
 
     def _fix_train_test_metrics(self, verbose=True) -> None:
         """
@@ -536,7 +581,7 @@ class MetricsPredictor:
         metrics_array = self.train_df[metrics].values
         metrics_array = imp.fit_transform(metrics_array)
         self.train_df[metrics] = metrics_array
-        metrics_array = self.test_df[metrics].values
+        metrics_array = self.test_df[metrics].values.astype(float)
         metrics_array = imp.fit_transform(metrics_array)
         self.test_df[metrics] = metrics_array
 
@@ -582,45 +627,31 @@ class MetricsPredictor:
 
     def create_train_test_split(
         self,
-        select_test="random",
-        test_size=0.2,
+        sorter_names=None,
+        recording_names=None,
+        test_size=0.5,
         random_state=42,
-        key=None,
         standard_scale=True,
         log_transform=True,
         verbose=True,
     ):
         assert self.metrics_df is not None, "compute metrics first"
-        if select_test == "random":
-            self.train_df, self.test_df = train_test_split(
-                self.metrics_df,
-                test_size=test_size,
-                random_state=random_state,
-                shuffle=True,
-                stratify=None,
-            )
-        elif select_test == "single_recording":
-            assert key is not None, "must provide key for recording"
-            self.train_df, self.test_df = train_test_split(
-                self.metrics_df[self.metrics_df["recording"] == key],
-                test_size=test_size,
-                random_state=random_state,
-                shuffle=True,
-                stratify=None,
-            )
-        elif select_test == "sorter":
-            assert key is not None, "must provide key for sorter"
-            self.train_df = self.metrics_df[self.metrics_df["sorter"] != key]
-            self.test_df = self.metrics_df[self.metrics_df["sorter"] == key]
-        elif select_test == "recording":
-            assert key is not None, "must provide key for recording"
-            self.train_df = self.metrics_df[self.metrics_df["recording"] != key]
-            self.test_df = self.metrics_df[self.metrics_df["recording"] == key]
-        else:
-            print(
-                "invalid select_test parameter, must be random, single_recording, sorter or recording"
-            )
-            return
+        mask = pd.Series(np.ones(len(self.metrics_df),dtype=bool))
+        if sorter_names is not None:
+            if type(sorter_names) is not list:
+                sorter_names = [sorter_names]
+            mask = mask * self.metrics_df["sorter"].isin(sorter_names)
+        if recording_names is not None:
+            if type(recording_names) is not list:
+                recording_names = [recording_names]
+            mask = mask * self.metrics_df["recording"].isin(recording_names)
+        self.train_df, self.test_df = train_test_split(
+            self.metrics_df[mask],
+            test_size=test_size,
+            random_state=random_state,
+            shuffle=True,
+            stratify=None,
+        )
         if verbose:
             print(
                 f"training set size: {len(self.train_df)}, test size: {len(self.test_df)}"
@@ -688,7 +719,7 @@ class MetricsPredictor:
         if sorter_names is not None:
             self.test_df = self.test_df[self.test_df["sorter"].isin(sorter_names)]
         if verbose:
-            print(f"training set size: {len(self.test_df)}")
+            print(f"test set size: {len(self.test_df)}")
         if log_transform:
             self._log_transform_train_test_metrics()
         self._fix_train_test_metrics(verbose=verbose)
@@ -729,8 +760,8 @@ class MetricsPredictor:
         self.target_feature = target_feature
         X_trn = self.train_df[metrics]
         y_trn = self.train_df[target_feature]
+        # MP.test_df[metrics].isna().sum()
         if oversample:
-            # print(y_trn.isna().sum())
             X_trn_resampled, y_trn_resampled = SMOTE().fit_resample(X_trn, y_trn)
             self.model = LogisticRegression(
                 solver=solver, random_state=random_state, penalty=penalty, C=C
@@ -739,6 +770,9 @@ class MetricsPredictor:
             self.model = LogisticRegression(
                 solver=solver, random_state=random_state, penalty=penalty, C=C
             ).fit(X_trn, y_trn)
+            # self.model = RandomForestClassifier(
+            #     random_state=random_state,
+            # ).fit(X_trn, y_trn)
         if predict:
             return self.model.predict(X_trn)
 
@@ -747,14 +781,12 @@ class MetricsPredictor:
         sorting,
         overwrite=False,
         n_jobs=1,
-        chunk_duration="0.1s",
-        ms_before=1,  # 0.5,
-        ms_after=2,  # 3,
+        chunk_duration="1.0s", #"0.1s",
+        ms_before=0.5,
+        ms_after=3,
         max_spikes_per_unit=200,
         cache_folder=".",
-        n_pca_components=3,
-        # overwrite_pca=False,
-        # overwrite_locations=False,
+        n_pca_components=2,
         verbose=False,
     ):
         recording_name = sorting["recording_name"]
@@ -763,17 +795,15 @@ class MetricsPredictor:
         if os.path.exists(folder) and not overwrite:
             if verbose:
                 print("loading cached waveforms from " + folder)
-            sa_disk = si.core.load_sorting_analyzer(folder=folder)
+            sa_disk = si.load_sorting_analyzer(folder=folder)
         else:
             if verbose:
                 print("caching waveforms to " + folder)
-            job_kwargs = dict(n_jobs=n_jobs, chunk_duration=chunk_duration)
-            sa_disk = si.core.create_sorting_analyzer(
+            job_kwargs = dict(n_jobs=1, chunk_duration=chunk_duration)
+            sa_disk = si.create_sorting_analyzer(
                 recording=sorting["recording"],
                 sorting=sorting["sorting"],
-                # mode="folder",
                 format="binary_folder",
-                # max_spikes_per_unit=max_spikes_per_unit,
                 folder=folder,
                 overwrite=True,
                 # allow_unfiltered=False,
@@ -781,35 +811,24 @@ class MetricsPredictor:
                 ms_after=ms_after,
                 sparse=True,
                 method="radius",
-                num_spikes_for_sparsity=100,
-                radius_um=60,
+                # num_spikes_for_sparsity=100,
+                # radius_um=60,
                 **job_kwargs,
             )
-            sa_disk.compute("noise_levels")
-            sa_disk.compute("random_spikes")
-            sa_disk.compute("waveforms")
-            sa_disk.compute("templates", operators=["average", "median"])
-            # sa_disk.compute("templates", operators="median")
-            # sa_disk.compute("unit_locations")
-            sa_disk.compute("principal_components")
-            sa_disk.compute("spike_locations")
-            sa_disk.compute("spike_amplitudes")
-
-        # if (
-        #     "spike_locations" not in we_disk.get_available_extension_names()
-        #     or overwrite_locations
-        # ):
-        #     if verbose:
-        #         print("computing spike locations")
-        #     sp.compute_spike_locations(
-        #         we_disk, load_if_exists=not (overwrite_locations)
-        #     )
-        # compute_principal_components(
-        #     we_disk,
-        #     load_if_exists=not (overwrite_pca),
-        #     n_components=n_pca_components,
-        #     mode="by_channel_local",
-        # )
+            if verbose:
+                print("computing analyzer extensions")
+            sa_disk.compute({
+                "noise_levels":{},
+                "random_spikes":{}, 
+                "waveforms":{"ms_before":ms_before, "ms_after": ms_after},
+                "templates":{},
+                "template_similarity":{},
+                "unit_locations":{},
+                "principal_components":{},
+                "spike_locations":{},
+                "spike_amplitudes":{},
+                "correlograms":{},
+            }, verbose=verbose)
         return sa_disk
 
     def _get_ground_truth_comparison(
@@ -830,7 +849,7 @@ class MetricsPredictor:
                     sorter = s["sorting_name"]
                     sr_sorting = s["sorting"]
                     # print(sr_sorting, SX_gt)
-                    comp = sc.compare_sorter_to_ground_truth(
+                    comp = si.compare_sorter_to_ground_truth(
                         SX_gt, sr_sorting, exhaustive_gt=True
                     )
                     well_detected = comp.get_well_detected_units(
